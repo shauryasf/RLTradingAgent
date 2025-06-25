@@ -1,13 +1,125 @@
-from finrl.meta.env_stock_trading.env_stocktrading import StockTradingEnv
-from finrl.config import INDICATORS
-from finrl.meta.preprocessor.preprocessors import FeatureEngineer
-from finrl.meta.preprocessor.yahoodownloader import YahooDownloader
+try:
+    from finrl.meta.env_stock_trading.env_stocktrading import StockTradingEnv
+    from finrl.config import INDICATORS
+    from finrl.meta.preprocessor.preprocessors import FeatureEngineer
+    from finrl.meta.preprocessor.yahoodownloader import YahooDownloader
+    FINRL_AVAILABLE = True
+except ImportError:
+    print("FinRL not available. Using standalone implementation.")
+    FINRL_AVAILABLE = False
+    # Define minimal indicators list
+    INDICATORS = [
+        "volume", "macd", "boll_ub", "boll_lb", "rsi_30",
+        "cci_30", "dx_30", "close_30_sma", "close_60_sma", "turbulence"
+    ]
+
 from src.rewards.reward_function import get_reward_function
+import gymnasium as gym
+from gymnasium import spaces
 
 import numpy as np
 import pandas as pd
 
-class SingleStockTradingEnv(StockTradingEnv):
+class BaseStockTradingEnv(gym.Env):
+    """Minimal stock trading environment when FinRL is not available"""
+    def __init__(self, df, **kwargs):
+        super().__init__()
+        self.df = df.copy()
+        self.stock_dim = kwargs.get('stock_dim', 1)
+        self.hmax = kwargs.get('hmax', 100)
+        self.initial_amount = kwargs.get('initial_amount', 10000)
+        self.transaction_cost_pct = kwargs.get('buy_cost_pct', [0.001])[0]
+        self.tech_indicator_list = kwargs.get('tech_indicator_list', INDICATORS)
+        
+        # Current state
+        self.day = 0
+        self.data = self.df.loc[self.day, :]
+        self.terminal = False
+        
+        # Portfolio state
+        self.state = [self.initial_amount] + [0] * self.stock_dim + list(self.data[self.tech_indicator_list].values)
+        self.asset_memory = [self.initial_amount]
+        self.portfolio_value = self.initial_amount
+        self.cost = 0
+        self.trades = 0
+        
+        # Action and observation space
+        self.action_space = spaces.Box(low=-1, high=1, shape=(self.stock_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, 
+            shape=(len(self.state),), dtype=np.float32
+        )
+    
+    def step(self, actions):
+        if self.terminal:
+            return self.state, 0, True, False, {}
+        
+        # Get current price
+        current_price = self.data['close']
+        
+        # Execute action
+        action = actions[0] * self.hmax  # Scale action
+        current_shares = self.state[1]  # Number of shares held
+        current_cash = self.state[0]    # Cash available
+        
+        if action > 0:  # Buy
+            shares_to_buy = min(action, current_cash // (current_price * (1 + self.transaction_cost_pct)))
+            cost = shares_to_buy * current_price * (1 + self.transaction_cost_pct)
+            current_cash -= cost
+            current_shares += shares_to_buy
+            self.cost += cost * self.transaction_cost_pct
+            self.trades += 1
+        elif action < 0:  # Sell
+            shares_to_sell = min(-action, current_shares)
+            revenue = shares_to_sell * current_price * (1 - self.transaction_cost_pct)
+            current_cash += revenue
+            current_shares -= shares_to_sell
+            self.cost += revenue * self.transaction_cost_pct
+            self.trades += 1
+        
+        # Update state
+        self.state[0] = current_cash
+        self.state[1] = current_shares
+        
+        # Move to next day
+        self.day += 1
+        
+        if self.day >= len(self.df.index.unique()) - 1:
+            self.terminal = True
+        else:
+            self.data = self.df.loc[self.day, :]
+            # Update technical indicators in state
+            self.state[2:] = list(self.data[self.tech_indicator_list].values)
+        
+        # Calculate portfolio value
+        self.portfolio_value = current_cash + current_shares * current_price
+        self.asset_memory.append(self.portfolio_value)
+        
+        # Calculate reward (simple return-based)
+        reward = (self.portfolio_value - self.initial_amount) / self.initial_amount
+        
+        return np.array(self.state, dtype=np.float32), reward, self.terminal, False, {}
+    
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
+        
+        self.day = 0
+        self.data = self.df.loc[self.day, :]
+        self.terminal = False
+        self.portfolio_value = self.initial_amount
+        self.cost = 0
+        self.trades = 0
+        self.asset_memory = [self.initial_amount]
+        
+        self.state = [self.initial_amount] + [0] * self.stock_dim + list(self.data[self.tech_indicator_list].values)
+        
+        return np.array(self.state, dtype=np.float32), {}
+
+# Choose base class based on FinRL availability
+BaseEnvClass = StockTradingEnv if FINRL_AVAILABLE else BaseStockTradingEnv
+
+class SingleStockTradingEnv(BaseEnvClass):
     def __init__(self, **kwargs):
         """
         Arguments:
@@ -76,9 +188,12 @@ class SingleStockTradingEnv(StockTradingEnv):
         benchmark_ticker = "^GSPC" # S&P 500
 
         try:
-            # Try using YahooDownloader
-            df_s = YahooDownloader(start_date=start_date, end_date=end_date, ticker_list=[ticker]).fetch_data()
-            df_benchmark = YahooDownloader(start_date=start_date, end_date=end_date, ticker_list=[benchmark_ticker]).fetch_data()
+            # Try using YahooDownloader if FinRL is available
+            if FINRL_AVAILABLE:
+                df_s = YahooDownloader(start_date=start_date, end_date=end_date, ticker_list=[ticker]).fetch_data()
+                df_benchmark = YahooDownloader(start_date=start_date, end_date=end_date, ticker_list=[benchmark_ticker]).fetch_data()
+            else:
+                raise ImportError("FinRL not available, using fallback")
         except Exception as e:
             print(f"YahooDownloader failed: {e}. Using fallback yfinance...")
             # Fallback to direct yfinance with better error handling
@@ -159,37 +274,40 @@ class SingleStockTradingEnv(StockTradingEnv):
 
         # Add technical indicators and turbulence with error handling
         try:
-            fe = FeatureEngineer(
-                use_technical_indicator=True,
-                tech_indicator_list=INDICATORS,
-                use_turbulence=True
-            )
-            processed_df = fe.preprocess_data(df)
-            
-            # Handle NaN values that might occur in technical indicators
-            if processed_df.isnull().any().any():
-                print("Warning: NaN values detected in processed data. Filling with forward/backward fill...")
-                processed_df = processed_df.ffill().bfill()
+            if FINRL_AVAILABLE:
+                fe = FeatureEngineer(
+                    use_technical_indicator=True,
+                    tech_indicator_list=INDICATORS,
+                    use_turbulence=True
+                )
+                processed_df = fe.preprocess_data(df)
                 
-                # If still NaN, fill with reasonable defaults
+                # Handle NaN values that might occur in technical indicators
                 if processed_df.isnull().any().any():
-                    print("Warning: Still NaN values after forward/backward fill. Using default values...")
-                    # Fill remaining NaNs with column means or zeros
-                    for col in processed_df.columns:
-                        if processed_df[col].isnull().any():
-                            if col in ['macd', 'rsi_30', 'cci_30', 'dx_30']:
-                                processed_df[col] = processed_df[col].fillna(0)  # Technical indicators default to 0
-                            elif col in ['boll_ub', 'boll_lb', 'close_30_sma', 'close_60_sma']:
-                                processed_df[col] = processed_df[col].fillna(processed_df['close'].mean())  # Price-based indicators use mean close
-                            elif col == 'turbulence':
-                                processed_df[col] = processed_df[col].fillna(0)  # Turbulence defaults to 0
-                            else:
-                                processed_df[col] = processed_df[col].fillna(0)  # Everything else defaults to 0
-            
-            return processed_df
+                    print("Warning: NaN values detected in processed data. Filling with forward/backward fill...")
+                    processed_df = processed_df.ffill().bfill()
+                    
+                    # If still NaN, fill with reasonable defaults
+                    if processed_df.isnull().any().any():
+                        print("Warning: Still NaN values after forward/backward fill. Using default values...")
+                        # Fill remaining NaNs with column means or zeros
+                        for col in processed_df.columns:
+                            if processed_df[col].isnull().any():
+                                if col in ['macd', 'rsi_30', 'cci_30', 'dx_30']:
+                                    processed_df[col] = processed_df[col].fillna(0)  # Technical indicators default to 0
+                                elif col in ['boll_ub', 'boll_lb', 'close_30_sma', 'close_60_sma']:
+                                    processed_df[col] = processed_df[col].fillna(processed_df['close'].mean())  # Price-based indicators use mean close
+                                elif col == 'turbulence':
+                                    processed_df[col] = processed_df[col].fillna(0)  # Turbulence defaults to 0
+                                else:
+                                    processed_df[col] = processed_df[col].fillna(0)  # Everything else defaults to 0
+                
+                return processed_df
+            else:
+                raise ImportError("FinRL not available")
             
         except Exception as fe_error:
-            print(f"FeatureEngineer failed: {fe_error}. Using basic data...")
+            print(f"FeatureEngineer failed: {fe_error}. Using basic data with simple technical indicators...")
             # Return basic processed data without technical indicators but with required structure
             df = df.sort_values(['date', 'tic']).reset_index(drop=True)
             
@@ -213,11 +331,13 @@ class SingleStockTradingEnv(StockTradingEnv):
             return df
 
     def step(self, actions):
-        next_state, reward, terminal, truncated, info = super().step(actions)
-
-        reward = self.reward_calculator.calculate(self, actions, next_state, reward, terminal, truncated, info)
-        
-        return next_state, reward, terminal, truncated, info
+        if FINRL_AVAILABLE:
+            next_state, reward, terminal, truncated, info = super().step(actions)
+            reward = self.reward_calculator.calculate(self, actions, next_state, reward, terminal, truncated, info)
+            return next_state, reward, terminal, truncated, info
+        else:
+            # Use base class step method
+            return super().step(actions)
 
     def reward_function(self, actions, next_state, base_reward, terminal, truncated, info, *, reward_logging=False):
         """Legacy reward function - now delegates to reward calculator"""

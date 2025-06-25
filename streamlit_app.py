@@ -22,17 +22,34 @@ src_path = project_root / "src"
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(src_path))
 
-# Now import the main app components
+# Now import the main app components with graceful fallbacks
 try:
     from stable_baselines3 import PPO
+    SB3_AVAILABLE = True
+except ImportError:
+    PPO = None
+    SB3_AVAILABLE = False
+    st.warning("⚠️ Stable Baselines3 not available. Running in demo mode with simulated predictions.")
+
+try:
     from src.envs import SingleStockTradingEnv
     from src.data.data_loader import DataLoader
     from src.agents.PPOAgent import TradingPPOAgent
     from src.inference.inference import TradingInferenceEngine
     from src.utils.metrics import PerformanceMetrics
+    FULL_FEATURES = True
 except ImportError as e:
-    st.error(f"Import error: {e}")
-    st.stop()
+    try:
+        from src.envs.simple_env import SimpleTradingEnv as SingleStockTradingEnv
+        st.info("🔧 Using simplified environment due to missing dependencies")
+        FULL_FEATURES = False
+        DataLoader = None
+        TradingPPOAgent = None
+        TradingInferenceEngine = None
+        PerformanceMetrics = None
+    except ImportError:
+        st.error(f"Core import error: {e}")
+        st.stop()
 
 # --------------------------
 # Model Management Section
@@ -45,10 +62,17 @@ class ModelManager:
     
     def __init__(self):
         try:
-            self.data_loader = DataLoader()
-            self.inference_engine = TradingInferenceEngine()
+            if FULL_FEATURES:
+                self.data_loader = DataLoader()
+                self.inference_engine = TradingInferenceEngine()
+            else:
+                self.data_loader = None
+                self.inference_engine = None
+                st.info("🎮 Running in simplified mode - some features may be limited")
         except Exception as e:
             st.error(f"Failed to initialize components: {e}")
+            self.data_loader = None
+            self.inference_engine = None
     
     def get_available_tickers(self):
         """Get list of available model tickers"""
@@ -58,6 +82,10 @@ class ModelManager:
     
     def load_model(self, ticker, env):
         """Load model from models/{ticker}.zip"""
+        if not SB3_AVAILABLE:
+            st.warning(f"⚠️ Cannot load model for {ticker} - Stable Baselines3 not available")
+            return None
+            
         model_path = MODELS_DIR / f"{ticker}.zip"
 
         if not model_path.exists():
@@ -192,7 +220,23 @@ if selected_ticker:
     st.header("🤖 Trading Recommendation")
     
     if st.button("Generate Prediction", type="primary"):
-        if 'loaded_model' not in st.session_state:
+        if not SB3_AVAILABLE:
+            # Demo mode - generate fake predictions
+            st.info("🎮 Demo Mode: Generating simulated prediction")
+            import random
+            random.seed(42)  # For consistent demo results
+            demo_actions = ["BUY", "SELL", "HOLD"]
+            demo_action = random.choice(demo_actions)
+            demo_quantity = random.randint(1, 50) if demo_action != "HOLD" else 0
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Recommended Action (Demo)", demo_action)
+            with col2:
+                st.metric("Recommended Quantity (Demo)", demo_quantity)
+            st.info("💡 This is a simulated prediction for demonstration purposes.")
+            
+        elif 'loaded_model' not in st.session_state:
             st.error("Model failed to load! Please try again.")
         else:
             try:
